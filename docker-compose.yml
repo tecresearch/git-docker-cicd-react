@@ -1,0 +1,13 @@
+services:
+  frontend:
+    image: ${IMAGE_NAME}:${IMAGE_TAG}
+    container_name: demo-frontend
+    ports:
+      - "80:80"
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s

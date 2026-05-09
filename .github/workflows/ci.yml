@@ -1,0 +1,45 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+
+permissions:
+  contents: read
+
+jobs:
+  build-test-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests (Vitest)
+        run: npm test
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Login to Docker Hub
+        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+      - name: Build and push Docker image
+        run: |
+          IMAGE=${{ secrets.DOCKERHUB_USERNAME }}/demo-frontend
+          TAG=sha-${{ github.sha }}
+          docker build -t $IMAGE:$TAG .
+          docker push $IMAGE:$TAG
+          # Tag as latest
+          docker tag $IMAGE:$TAG $IMAGE:latest
+          docker push $IMAGE:latest

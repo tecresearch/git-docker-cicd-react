@@ -1,0 +1,120 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Docker image tag to deploy'
+        required: false
+        default: 'latest'
+  workflow_run:
+    workflows: ['CI/CD']
+    branches: [main]
+    types:
+      - completed
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+
+    steps:
+      - name: Install Tailscale
+        run: curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Connect to Tailscale
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          sudo tailscale up \
+            --authkey "$TAILSCALE_AUTHKEY" \
+            --accept-dns=true \
+            --accept-routes=true \
+            --hostname github-actions-deploy-frontend
+          tailscale status
+
+      - name: Determine image tag
+        id: image_tag
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            echo "image_tag=${{ inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+          elif [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            echo "image_tag=sha-${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          elif [ "${GITHUB_EVENT_NAME}" = "workflow_run" ]; then
+            echo "image_tag=sha-${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "image_tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy to VPS
+        uses: appleboy/ssh-action@v1.0.0
+        env:
+          IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/demo-frontend
+          IMAGE_TAG: ${{ steps.image_tag.outputs.image_tag }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
+          envs: IMAGE_NAME,IMAGE_TAG,DOCKERHUB_USERNAME,DOCKERHUB_TOKEN
+          script: |
+            set -e
+
+            APP_DIR="/home/$USER/app"
+            REPO_URL="https://github.com/${{ github.repository }}.git"
+
+            # ---- Ensure repository is up-to-date on VPS ----
+            if [ ! -d "$APP_DIR/.git" ]; then
+              echo "Cloning repo..."
+              git clone "$REPO_URL" "$APP_DIR"
+            else
+              echo "Pulling latest changes..."
+              cd "$APP_DIR"
+              git fetch origin main
+              git reset --hard origin/main
+            fi
+
+            cd "$APP_DIR"
+
+            # ---- Docker Hub login ----
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+
+            # ---- Pull the exact image ----
+            echo "Pulling image: $IMAGE_NAME:$IMAGE_TAG"
+            docker pull "$IMAGE_NAME:$IMAGE_TAG"
+
+            # ---- Stop & remove old containers (if any) ----
+            echo "Stopping existing services..."
+            docker compose down --remove-orphans || true
+
+            # ---- Start with env vars set ----
+            echo "Starting new container..."
+            IMAGE_NAME="$IMAGE_NAME" IMAGE_TAG="$IMAGE_TAG" docker compose up -d
+
+            # ---- Manual health check loop (in addition to Docker's own healthcheck) ----
+            echo "Checking health..."
+            for i in $(seq 1 30); do
+              if curl -f http://localhost > /dev/null 2>&1; then
+                echo "✅ Healthy on attempt $i"
+                break
+              fi
+              if [ $i -eq 30 ]; then
+                echo "❌ Unhealthy – printing logs"
+                docker compose logs
+                exit 1
+              fi
+              sleep 2
+            done
+
+            echo "✅ Deployment successful"
